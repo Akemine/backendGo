@@ -1,8 +1,8 @@
 package main
 
 import (
+	"bytes"
 	"context"
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -19,7 +19,6 @@ import (
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
 	"github.com/rs/cors"
-	"golang.org/x/crypto/bcrypt"
 	"golang.org/x/oauth2"
 )
 
@@ -29,44 +28,24 @@ var (
 	validToken   *oauth2.Token
 	stateMutex   sync.RWMutex
 	stateStore   = make(map[string]time.Time)
-	db           *sql.DB
 )
 
-func generateRandomState() (string, error) {
-	b := make([]byte, 32)
-	_, err := rand.Read(b)
-	if err != nil {
-		return "", err
-	}
-	return base64.URLEncoding.EncodeToString(b), nil
-}
-
 func handleLogin(w http.ResponseWriter, r *http.Request) {
-	fmt.Println("On appelle handleLogin")
-
-	// Décodage du JSON
-	var credentials struct {
-		Email    string `json:"email"`
-		Password string `json:"password"`
-	}
-
-	err := json.NewDecoder(r.Body).Decode(&credentials)
+	// Envoyer les identifiants au serveur d'authentification
+	resp, err := sendCredentials(w, r)
 	if err != nil {
-		http.Error(w, "Erreur lors de la lecture du JSON", http.StatusBadRequest)
+		http.Error(w, "Erreur lors de l'authentification", http.StatusInternalServerError)
+		return
+	}
+	defer resp.Body.Close()
+
+	// Vérifier le statut de la réponse
+	if resp.StatusCode != http.StatusOK {
+		http.Error(w, "Authentification échouée", resp.StatusCode)
 		return
 	}
 
-	if credentials.Email == "" || credentials.Password == "" {
-		http.Error(w, "Email et mot de passe requis", http.StatusBadRequest)
-		return
-	}
-
-	// Vérifier les identifiants dans la base de données
-	if !verifyCredentials(credentials.Email, credentials.Password) {
-		http.Error(w, "Identifiants invalides", http.StatusUnauthorized)
-		return
-	}
-
+	// Si l'authentification réussit, continuer avec la génération du state et la redirection
 	state, err := generateRandomState()
 	if err != nil {
 		http.Error(w, "Erreur lors de la génération du state", http.StatusInternalServerError)
@@ -83,7 +62,6 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 
 func handleCallback(w http.ResponseWriter, r *http.Request) {
 	fmt.Println("On appelle handleCallback")
-	fmt.Printf("URL de callback reçue : %s\n", r.URL.String())
 	code := r.URL.Query().Get("code")
 	state := r.URL.Query().Get("state")
 
@@ -98,7 +76,6 @@ func handleCallback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if code == "" {
-		fmt.Println("Aucun code reçu dans l'URL")
 		http.Error(w, "Code manquant", http.StatusBadRequest)
 		return
 	}
@@ -110,8 +87,6 @@ func handleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	
-
 	// Stockez le token valide
 	tokenMutex.Lock()
 	validToken = token
@@ -119,13 +94,11 @@ func handleCallback(w http.ResponseWriter, r *http.Request) {
 
 	// Renvoyez le token au frontend
 	w.Header().Set("Content-Type", "application/json")
-	fmt.Println("token : ", token)
 	json.NewEncoder(w).Encode(token)
 }
 
 func handleLogout(w http.ResponseWriter, r *http.Request) {
 	fmt.Println("On appelle handleLogout")
-
 	// Vérifier si un token est présent dans l'en-tête Authorization
 	authHeader := r.Header.Get("Authorization")
 	if authHeader == "" {
@@ -159,7 +132,6 @@ func handleLogout(w http.ResponseWriter, r *http.Request) {
 func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		authHeader := r.Header.Get("Authorization")
-		// fmt.Println("authHeader : ", authHeader)
 		if authHeader == "" {
 			http.Error(w, "Autorisation manquante", http.StatusUnauthorized)
 			return
@@ -183,7 +155,6 @@ func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 
 		// Vérifier si le token est expiré ou ne correspond pas
 		if token.Expiry.Before(time.Now()) || bearerToken != token.AccessToken {
-			// fmt.Println("Token expiré ou ne correspondant pas, tentative de rafraîchissement")
 			newToken, err := refreshToken(token)
 			if err != nil {
 				http.Error(w, "Impossible de rafraîchir le token", http.StatusUnauthorized)
@@ -195,7 +166,6 @@ func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 
 			// Renvoyer une réponse avec le code d'état 401 et le nouveau token dans un en-tête
 			w.Header().Set("X-New-Token", newToken.AccessToken)
-			// fmt.Println("newToken.AccessToken : ", newToken.AccessToken)
 			w.WriteHeader(http.StatusOK)
 			fmt.Println("Token rafraîchi avec succès")
 		}
@@ -286,36 +256,39 @@ func init() {
 		},
 		RedirectURL: "http://localhost:8080/callback",
 	}
-
-	// Configuration de la connexion à la base de données
-	dbinfo := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
-		os.Getenv("DB_HOST"), os.Getenv("DB_PORT"), os.Getenv("DB_USER"), os.Getenv("DB_PASSWORD"), os.Getenv("DB_NAME"))
-
-	var dbErr error
-	db, dbErr = sql.Open("postgres", dbinfo)
-	if dbErr != nil {
-		log.Fatal("Erreur lors de la connexion à la base de données : ", dbErr)
-	}
-
-	if err := db.Ping(); err != nil {
-		log.Fatal("Erreur lors du ping de la base de données : ", err)
-	}
-
-	fmt.Println("Connexion à la base de données établie avec succès")
 }
 
-func verifyCredentials(email, password string) bool {
-	var hashedPassword string
-	err := db.QueryRow("SELECT password_hash FROM users WHERE email = $1", email).Scan(&hashedPassword)
+func generateRandomState() (string, error) {
+	b := make([]byte, 32)
+	_, err := rand.Read(b)
 	if err != nil {
-		if err == sql.ErrNoRows {
-			return false
-		}
-		log.Printf("Erreur lors de la récupération du mot de passe : %v", err)
-		return false
+		return "", err
+	}
+	return base64.URLEncoding.EncodeToString(b), nil
+}
+
+func sendCredentials(w http.ResponseWriter, r *http.Request) (*http.Response, error) {
+	// Décoder le JSON reçu du front
+	var credentials struct {
+		Email    string `json:"email"`
+		Password string `json:"password"`
+	}
+	err := json.NewDecoder(r.Body).Decode(&credentials)
+	if err != nil {
+		return nil, fmt.Errorf("erreur lors de la lecture du JSON: %v", err)
 	}
 
-	// Comparer le mot de passe fourni avec le hash stocké
-	err = bcrypt.CompareHashAndPassword([]byte(hashedPassword), []byte(password))
-	return err == nil
+	// Préparer les données à envoyer au serveur d'authentification
+	credentialsData, err := json.Marshal(credentials)
+	if err != nil {
+		return nil, fmt.Errorf("erreur lors de la préparation des données: %v", err)
+	}
+
+	// Envoyer la requête au serveur d'authentification
+	resp, err := http.Post("http://localhost:9096/login", "application/json", bytes.NewBuffer(credentialsData))
+	if err != nil {
+		return nil, fmt.Errorf("erreur lors de la connexion au serveur d'authentification: %v", err)
+	}
+
+	return resp, nil
 }
